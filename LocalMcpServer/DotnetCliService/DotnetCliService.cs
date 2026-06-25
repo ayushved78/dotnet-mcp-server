@@ -1,5 +1,7 @@
 ﻿using MCP.Core.Services;
+using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net.Http;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -403,4 +405,161 @@ public sealed partial class DotnetCliService(IProjectConfigService config, ILogg
             Summary    = reason,
             Diagnostics = []
         };
+
+    // ── Run (build → stop → start → health) ──────────────────────────────────
+
+    // Keyed by projectName (case-insensitive). Survives across MCP tool calls within the server lifetime.
+    private static readonly ConcurrentDictionary<string, Process> _runningProcesses =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    public async Task<AppRunResult> RunAsync(
+        string projectName,
+        string appUrl,
+        string? buildTarget = null,
+        bool clean = true,
+        int healthTimeoutSeconds = 120,
+        CancellationToken ct = default)
+    {
+        var sw = Stopwatch.StartNew();
+
+        // ── 1. Kill existing process BEFORE build (releases exe file lock) ──
+        var wasRunning = false;
+        if (_runningProcesses.TryRemove(projectName, out var existing))
+        {
+            try
+            {
+                if (!existing.HasExited)
+                {
+                    existing.Kill(entireProcessTree: true);
+                    await existing.WaitForExitAsync(ct);
+                    wasRunning = true;
+                }
+                existing.Dispose();
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "[run] Failed to kill existing process for {Project}", projectName);
+            }
+        }
+
+        // ── 2. Build (exe lock is now released) ───────────────────────────
+        var buildResult = await BuildAsync(projectName, buildTarget, clean: clean, ct: ct);
+        if (!buildResult.Success)
+        {
+            return new AppRunResult
+            {
+                BuildSuccess     = false,
+                BuildSummary     = buildResult.Summary,
+                Diagnostics      = buildResult.Diagnostics,
+                TotalDiagnostics = buildResult.TotalDiagnostics,
+                AppStarted       = null,
+                RunStatus        = "build_failed",
+                TotalDurationMs  = sw.ElapsedMilliseconds
+            };
+        }
+
+        // ── 3. Resolve build root & target ───────────────────────
+        var root   = ResolveRoot(projectName);
+        var target = ResolveBuildTarget(root, buildTarget)
+                     ?? throw new InvalidOperationException("Cannot resolve build target for dotnet run.");
+
+        // ── 4. Start — redirect output so we can detect early exit ────
+        var psi = new ProcessStartInfo("dotnet", $"run --project \"{target}\" --no-build")
+        {
+            WorkingDirectory       = root,
+            UseShellExecute        = false,
+            CreateNoWindow         = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true
+        };
+
+        Process proc;
+        try
+        {
+            proc = Process.Start(psi)
+                   ?? throw new InvalidOperationException("dotnet run returned null Process.");
+
+            // Drain streams to prevent blocking on full pipe buffers
+            proc.OutputDataReceived += (_, e) =>
+            {
+                if (e.Data is not null)
+                    logger.LogDebug("[run][{Project}] {Line}", projectName, e.Data);
+            };
+            proc.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data is not null)
+                    logger.LogDebug("[run][{Project}][stderr] {Line}", projectName, e.Data);
+            };
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "[run] Failed to start process for {Project}", projectName);
+            return new AppRunResult
+            {
+                BuildSuccess    = true,
+                BuildSummary    = buildResult.Summary,
+                AppStarted      = false,
+                RunStatus       = "launch_failed",
+                TotalDurationMs = sw.ElapsedMilliseconds
+            };
+        }
+        _runningProcesses[projectName] = proc;
+        logger.LogInformation("[run] Started {Project} PID={Pid}", projectName, proc.Id);
+        logger.LogInformation("[run] Started {Project} PID={Pid}", projectName, proc.Id);
+
+        // ── 5. Health poll — SSL-tolerant, waits the full timeout ────
+        var deadline = DateTime.UtcNow.AddSeconds(healthTimeoutSeconds);
+        var baseUrl  = appUrl.TrimEnd('/');
+        var started  = false;
+
+        // Accept self-signed / dev certs; never throw on SSL errors during probe
+        using var handler = new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+        };
+        using var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) };
+
+        while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
+        {
+            // Process died already → fail fast
+            if (proc.HasExited)
+            {
+                logger.LogWarning("[run] Process exited early (code {Code}) for {Project}",
+                    proc.ExitCode, projectName);
+                break;
+            }
+
+            try
+            {
+                var resp = await http.GetAsync(baseUrl, HttpCompletionOption.ResponseHeadersRead, ct);
+                if ((int)resp.StatusCode < 500)
+                {
+                    started = true;
+                    break;
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            {
+                // Not up yet — keep polling
+                logger.LogDebug("[run] Health probe pending for {Project}: {Msg}", projectName, ex.Message);
+            }
+
+            await Task.Delay(1000, ct);
+        }
+
+        logger.LogInformation("[run] {Project} poll complete — started={Started} after {Ms}ms",
+            projectName, started, sw.ElapsedMilliseconds);
+
+        return new AppRunResult
+        {
+            BuildSuccess     = true,
+            BuildSummary     = buildResult.Summary,
+            AppStarted       = started,
+            AppUrl           = baseUrl,
+            RunStatus        = started ? (wasRunning ? "restarted" : "started") : "timeout",
+            TotalDurationMs  = sw.ElapsedMilliseconds
+        };
+    }
 }
