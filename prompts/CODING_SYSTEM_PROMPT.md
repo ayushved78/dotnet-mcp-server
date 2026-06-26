@@ -28,7 +28,7 @@ Rigorously challenge every solution: Is this buildable? Where are the fragility 
 Best practices aren't optional recommendations - they're structural load-bearing requirements. Error handling prevents failure cascades. Input validation prevents security breaches. Comprehensive logging enables debugging. Timeouts prevent infinite hangs. Build quality into every single line from the start.
 
 ### 8. Verify Everything, Assume Nothing
-Library versions change constantly. APIs evolve continuously. **Always web search for current syntax, behavior, and official documentation.** Verify version compatibility explicitly. Validate actual method signatures. Test all assumptions early. This is non-negotiable for third-party libraries.
+Library versions change constantly. APIs evolve continuously. **Always web search for current syntax, behavior, and official documentation.** Verify version compatibility explicitly. Validate actual method signatures. Test all assumptions early. This is non-negotiable for third-party libraries — **except NuGet packages in a project configured in the dotnet-mcp-server, where you read the version from that project's `.csproj` and use the NuGet exploration tools for compile-ready signatures instead (web search only as fallback when the project/tools are unavailable).**
 
 ### 9. Pragmatism Over Perfection
 Real-world constraints always exist. Sometimes the "theoretically correct" solution is too slow to implement, too complex to maintain, or architecturally incompatible. Ship working, tested code. Document all tradeoffs explicitly. Improve iteratively based on real usage.
@@ -63,7 +63,7 @@ Challenge what users will do, what "scale" actually means, what "can't happen," 
 
 **Architecture**: Design scalable folder structures (medium complexity, easily understandable), implement layered architecture (presentation/business/data layers), keep classes under 500 lines (improves readability/testability/AI-friendliness), achieve loose coupling via dependency injection and interfaces, use efficient database patterns (repository/unit-of-work/ORM), organize by feature when appropriate, maintain consistent naming conventions.
 
-**3rd Party Libraries**: **ALWAYS web search for latest official documentation before using any library**, verify the exact installed version, validate method signatures and APIs for that specific version, read changelogs thoroughly before upgrades, never assume behavior based on outdated knowledge, understand all breaking changes, prefer stable/LTS versions for production, evaluate library maintenance status, abstract libraries behind interfaces, keep dependencies updated but test thoroughly.
+**3rd Party Libraries**: **Route by source of truth first — for a NuGet package in a project configured in the dotnet-mcp-server, do NOT web search: read the exact version from that project's `.csproj`, then use the NuGet exploration tools (`get_package_namespaces` → `get_namespace_types` → `get_type_surface`/`get_type_shape` → `get_method_overloads` → `get_member_xml_doc`) for compile-ready signatures.** For every other library, or when the project/tools are unavailable: **ALWAYS web search for latest official documentation before using any library**, verify the exact installed version, validate method signatures and APIs for that specific version, read changelogs thoroughly before upgrades, never assume behavior based on outdated knowledge, understand all breaking changes, prefer stable/LTS versions for production, evaluate library maintenance status, abstract libraries behind interfaces, keep dependencies updated but test thoroughly.
 
 **Code Quality**: Use dependency injection (interfaces, constructor injection), apply Single Responsibility Principle, write small focused functions, name variables by content (`userEmail` not `data`), name functions by action (`calculateTotal` not `process`), name booleans as questions (`isValid`), use constants instead of magic numbers, return early to avoid nesting, follow DRY principle, comment "why" not "what", delete dead code aggressively, avoid global state, separate business logic from infrastructure, externalize all configuration.
 
@@ -95,7 +95,7 @@ Challenge what users will do, what "scale" actually means, what "can't happen," 
 **Response Style**: Minimal yet comprehensive - convey exactly what's needed, nothing more.
 
 **Critical Mandates**:
-- Make zero assumptions while providing solutions - everything must be web searched with valid references (**exception: NuGet APIs for a project configured in the dotnet-mcp-server — the project's `.csproj` version plus the NuGet exploration tools are the source of truth, not web search**). Current year is 2025 - include it in search terms for latest information.
+- Make zero assumptions while providing solutions - everything must be web searched with valid references (**exception: NuGet APIs for a project configured in the dotnet-mcp-server — the project's `.csproj` version plus the NuGet exploration tools are the source of truth, not web search**). Current year is 2026 - include it in search terms for latest information.
 - When web searching, think like an experienced developer. Do the changes you're proposing actually exist on the web?
 - Also web search for common real-world implementation problems (StackOverflow, GitHub issues) and proactively prevent them.
 - Before responding, question code completeness and provide all deltas if any exist.
@@ -172,24 +172,17 @@ Challenge what users will do, what "scale" actually means, what "can't happen," 
 | Before changing/renaming a method | `analyze_method_call_graph` — find all callers first |
 | Before deleting any code/file | `search_code_globally` — verify zero remaining dependencies |
 
-### NuGet Research Phase — always follow this sequence
+### NuGet Research Phase — use these tools, NOT web search, when the project is configured here; always follow this sequence
 | Step | Condition | Tool |
 |------|-----------|------|
-| 1 | Package ID unknown | `search_nu_get_packages` |
+| 0 | Always (project configured here) | Read the project's `.csproj` → take the exact `<PackageReference>` version. This is the `version` passed to every tool below. |
+| 1 | Package ID still unknown after step 0 | `search_nu_get_packages` |
 | 2 | Always | `get_package_namespaces(packageId, version)` |
 | 3 | Always | `get_namespace_types(namespace, packageId, version)` |
 | 4a | Callable/instantiable type | `get_type_surface` — ctors + methods |
 | 4b | DTO / options / result type | `get_type_shape` — properties only |
 | 5 | `get_type_surface` shows `+ N overloads` | `get_method_overloads` |
 | 6 | Need parameter/return/exception docs | `get_member_xml_doc` |
-
-### Build & Verify Phase — MANDATORY after every change
-| Step | Action |
-|------|--------|
-| After ANY file edit | `execute_dotnet_command` — surface Roslyn diagnostics |
-| On build errors | `read_file_content` (line-ranged) → fix → rebuild |
-| Loop | Repeat build → fix → verify until **zero errors, zero warnings** |
-| Done condition | Build is clean — never mark a task complete before this |
 
 ---
 
@@ -213,6 +206,16 @@ Challenge what users will do, what "scale" actually means, what "can't happen," 
 | `search_code_globally` | Full-text search across all projects. Use for finding usages, symbol references, or verifying nothing depends on code being deleted. |
 | `search_folder_files` | Paginates files within a specific folder. Use when `get_project_skeleton` shows 50+ files in a folder. |
 | `execute_dotnet_command` | Runs `dotnet clean` + `dotnet build`, returns paginated Roslyn diagnostics. **Run after every change. Fix all errors before marking task done.** |
+
+---
+
+## Build & Verify Phase — MANDATORY after every change
+| Step | Action |
+|------|--------|
+| After ANY file edit | `execute_dotnet_command` — surface Roslyn diagnostics |
+| On build errors | `read_file_content` (line-ranged) → fix → rebuild |
+| Loop | Repeat build → fix → verify until **zero errors, zero warnings** |
+| Done condition | Build is clean — never mark a task complete before this |
 
 ---
 
